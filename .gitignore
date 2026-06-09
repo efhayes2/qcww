@@ -1,0 +1,31 @@
+# --- PyCharm/JetBrains ---
+.idea/
+*.iml
+cmake-build-*/
+*.xml
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+build/
+dist/
+
+#ignore graphics
+*.png
+
+
+
+# --- Quant/Data Artifacts ---
+# Exclude data files to keep the repo small and avoid leaking data
+*.csv
+*.parquet
+*.h5
+*.log
+.env
+
+# --- macOS ---
+.DS_Store
