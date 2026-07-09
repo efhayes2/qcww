@@ -36,7 +36,7 @@ def run_profit_attribution(csv_path):
 
         plt.plot(cum_pl, label=f"{s.replace('target_waha_', '').upper()} Attribution")
 
-    plt.title("WHITWATER SPOT STRATEGY: PROFIT ATTRIBUTION BY HUB ($0.05 TC)", fontsize=14, fontweight='bold')
+    plt.title("WHITEWATER FORWARD STRATEGY: PROFIT ATTRIBUTION BY HUB", fontsize=14, fontweight='bold')
     plt.ylabel("Cumulative Net P&L ($)")
     plt.grid(True, alpha=0.3)
     plt.legend()
@@ -46,7 +46,7 @@ def run_profit_attribution(csv_path):
     plt.savefig(save_path)
 
     # Display the summary table
-    print("\nHUB RESILIENCE SUMMARY ($0.05 TC per MMBtu):")
+    print("\nHUB RESILIENCE SUMMARY (Forward strategy):")
     print("-" * 50)
     attr_df = pd.DataFrame(attribution).T
     print(attr_df)
@@ -55,5 +55,5 @@ def run_profit_attribution(csv_path):
 
 
 if __name__ == "__main__":
-    # Point to the specific spot result file that yielded the 1.26 Sharpe
+    # Forward basis was the last active strategy under exploration; attribute its per-hub P&L.
     run_profit_attribution('~/data/pngs/whitewater_forward_current.csv')

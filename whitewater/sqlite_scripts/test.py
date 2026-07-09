@@ -3,7 +3,7 @@ import pandas as pd
 from pathlib import Path
 
 # Path to your DB
-db_path = Path.home() / "PyCharmProjects" / "QuantCode26" / "whitewater" / "whitewater.db"
+db_path = Path.home() / "PyCharmProjects" / "qcww" / "whitewater" / "whitewater.db"
 
 
 def inspect_db():

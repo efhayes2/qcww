@@ -5,7 +5,7 @@ from pathlib import Path
 
 # --- 1. PATH CONFIGURATION (Mac/efh2) ---
 # Using Path.home() to resolve to /Users/efh2/
-base_project_dir = Path.home() / "PyCharmProjects" / "QuantCode26" / "whitewater"
+base_project_dir = Path.home() / "PyCharmProjects" / "qcww" / "whitewater"
 data_dir = base_project_dir / "data" / "fixed_float_swap_curves"
 db_path = base_project_dir / "whitewater.db"
 scripts_dir = base_project_dir / "sqlite_scripts"

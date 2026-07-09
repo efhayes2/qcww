@@ -9,15 +9,24 @@ from pathlib import Path
 
 from whitewater.whitewater_analyzer import WhitewaterDashboard
 from whitewater.whitewater_tearsheet import WhitewaterMasterTearSheet
+from whitewater.costs import transaction_cost
 
 
 class WhitewaterSpotStrategy:
-    def __init__(self, excel_path, base_lots, high_vol_lots, tc_per_mmbtu, exclude_hh):
+    def __init__(self, excel_path, base_lots, high_vol_lots, tc_per_mmbtu, exclude_hh, weather_mode='today'):
         self.excel_path = os.path.expanduser(excel_path)
         self.base_lots = base_lots
         self.high_vol_lots = high_vol_lots
         self.contract_size = 10000
         self.tc_per_mmbtu = tc_per_mmbtu
+
+        # Weather driver for cold-snap sizing (and the model's MAF temp feature):
+        #   'today'    -> today's realized min temp, used as a persistence proxy for tomorrow's
+        #                 forecast. Known at decision time -> no look-ahead. (default)
+        #   'tomorrow' -> realized next-day min temp. Perfect foresight -> upper-bound benchmark only.
+        if weather_mode not in ('today', 'tomorrow'):
+            raise ValueError("weather_mode must be 'today' or 'tomorrow'")
+        self.weather_mode = weather_mode
 
         # Determine active trading spreads
         self.exclude_hh = exclude_hh
@@ -72,7 +81,12 @@ class WhitewaterSpotStrategy:
             for i in range(1, 4):
                 df[f'{s}_lag{i}'] = df[s].shift(i)
 
-        df['tomorrow_min_temp_MAF'] = df['min_temp_f_MAF']
+        # today = min temp known at decision time (day t); tomorrow = realized next-day min temp (t+1)
+        df['today_min_temp_MAF'] = df['min_temp_f_MAF']
+        df['tomorrow_min_temp_MAF'] = df['min_temp_f_MAF'].shift(-1)
+        # Single weather driver selected by weather_mode; this is the only temp column fed downstream.
+        df['weather_signal_MAF'] = (df['tomorrow_min_temp_MAF'] if self.weather_mode == 'tomorrow'
+                                    else df['today_min_temp_MAF'])
         drop_cols = ['Agua_Dulce', 'min_temp_f_PEQ']
         self.full_df = df.drop(columns=drop_cols, errors='ignore').dropna().sort_index()
 
@@ -81,7 +95,10 @@ class WhitewaterSpotStrategy:
 
     def run_backtest(self):
         final_results = []
-        feature_cols = [c for c in self.full_df.columns if 'target' not in c]
+        # Drop spread targets and the raw today/tomorrow helpers; weather_signal_MAF is the single
+        # weather feature actually used (its dating is governed by weather_mode).
+        helper_cols = ('today_min_temp_MAF', 'tomorrow_min_temp_MAF')
+        feature_cols = [c for c in self.full_df.columns if 'target' not in c and c not in helper_cols]
         for trade_year in [2021, 2022, 2023, 2024]: #, 2025]:
             train = self.full_df.loc[f"{trade_year - 5}-01-01":f"{trade_year - 1}-12-31"]
             test = self.full_df.loc[f"{trade_year}-01-01":f"{trade_year}-12-31"]
@@ -98,14 +115,15 @@ class WhitewaterSpotStrategy:
 
     def simulate_spot_logic(self):
         df = self.results_df
-        df['current_lots'] = np.where(df['tomorrow_min_temp_MAF'] < 35, self.high_vol_lots, self.base_lots)
+        df['current_lots'] = np.where(df['weather_signal_MAF'] < 35, self.high_vol_lots, self.base_lots)
         uri_mask = (df.index >= '2021-02-01') & (df.index <= '2021-02-28')
 
         for s in self.spreads:
             df[f'sig_{s}'] = np.where(df[f'pred_{s}'] > df[s], 1, -1)
             df[f'pos_{s}'] = df[f'sig_{s}'] * df['current_lots'] * self.contract_size
-            df[f'tc_daily_{s}'] = df[f'pos_{s}'].abs() * self.tc_per_mmbtu
-            gross_pl = df[s].diff().shift(-1) * df[f'sig_{s}'] * df['current_lots'] * self.contract_size
+            # Round-trip tc, half on entry/half on exit; same-direction continuation is free.
+            df[f'tc_daily_{s}'] = transaction_cost(df[f'pos_{s}'], self.tc_per_mmbtu)
+            gross_pl = df[s].diff().shift(-1) * df[f'pos_{s}']
             df[f'daily_pl_{s}'] = gross_pl - df[f'tc_daily_{s}']
             df.loc[uri_mask, f'daily_pl_{s}'] = 0.0
 
@@ -128,16 +146,16 @@ class WhitewaterSpotStrategy:
 
 
 if __name__ == "__main__":
-    XLSX = '~/PyCharmProjects/QuantCode26/whitewater/data/trading_data.xlsx'
-
     # --- Configuration ---
-    XLSX = '~/PyCharmProjects/QuantCode26/whitewater/data/trading_data.xlsx'
+    # Resolve paths relative to this file so the repo can be renamed/moved freely.
+    XLSX = str(Path(__file__).resolve().parent / "data" / "trading_data.xlsx")
     tc_list = [0.02, 0.04, 0.05, 0.06]
     exclude_hh_list = [True, False]
 
     base_lots = 3
     high_vol_lots = 10
     capital = 10000000
+    weather_mode = 'today'  # 'today' = forecast proxy (no look-ahead); 'tomorrow' = perfect-foresight benchmark
 
     # --- Double Loop Execution ---
     for tc_val in tc_list:
@@ -150,7 +168,8 @@ if __name__ == "__main__":
                                               base_lots=base_lots,
                                               high_vol_lots=high_vol_lots,
                                               tc_per_mmbtu=tc_val,
-                                              exclude_hh=hh_val)
+                                              exclude_hh=hh_val,
+                                              weather_mode=weather_mode)
 
             # Standardize: Load -> Backtest (Model) -> Simulate (P&L) -> Export (CSV)
             strategy.load_and_prep() \
@@ -160,13 +179,14 @@ if __name__ == "__main__":
 
             # 2. Run Dashboard (PNG Generation)
             analyzer = WhitewaterDashboard()
-            analyzer.load_data().run_analysis(tc=tc_val, no_HH=hh_val)
+            analyzer.load_data().run_analysis(tc=tc_val, no_HH=hh_val, weather_mode=weather_mode)
 
             # 3. Run Master Tear Sheet (PDF Generation)
             # Pass the same capital, no_HH, and tc to ensure the report matches the run
             WhitewaterMasterTearSheet(capital=capital,
                                       no_HH=hh_val,
-                                      tc_per_mmbtu=tc_val).load_data().generate_pdf()
+                                      tc_per_mmbtu=tc_val,
+                                      weather_mode=weather_mode).load_data().generate_pdf()
 
     print("\n--- All Scenarios Complete ---")
 

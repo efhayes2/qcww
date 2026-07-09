@@ -8,14 +8,21 @@ from datetime import datetime
 from pathlib import Path
 from matplotlib.gridspec import GridSpec
 
+from whitewater.costs import transaction_cost
+
 
 class WhitewaterForwardStrategy:
-    def __init__(self, db_path, base_lots=15, high_vol_lots=50, tc_per_mmbtu=0.01):
+    def __init__(self, db_path, base_lots=15, high_vol_lots=50, tc_per_mmbtu=0.01, weather_mode='today'):
         self.db_path = Path(os.path.expanduser(db_path))
         self.base_lots = base_lots
         self.high_vol_lots = high_vol_lots
         self.contract_size = 10000
         self.tc_per_mmbtu = tc_per_mmbtu
+        # 'today' = today's realized min temp as a persistence proxy for tomorrow's forecast (no
+        # look-ahead, default); 'tomorrow' = realized next-day temp (perfect-foresight benchmark only).
+        if weather_mode not in ('today', 'tomorrow'):
+            raise ValueError("weather_mode must be 'today' or 'tomorrow'")
+        self.weather_mode = weather_mode
         self.spreads = ['target_waha_hh', 'target_waha_katy', 'target_waha_hsc']
         self.full_df = None
         self.results_df = None
@@ -53,13 +60,20 @@ class WhitewaterForwardStrategy:
         for s in self.spreads:
             for i in range(1, 4): df[f'{s}_lag{i}'] = df[s].shift(i)
 
-        df['tomorrow_min_temp_MAF'] = df['min_temp_f_MAF']
+        # today = min temp known at decision time (day t); tomorrow = realized next-day min temp (t+1)
+        df['today_min_temp_MAF'] = df['min_temp_f_MAF']
+        df['tomorrow_min_temp_MAF'] = df['min_temp_f_MAF'].shift(-1)
+        # Single weather driver selected by weather_mode; the only temp column fed downstream.
+        df['weather_signal_MAF'] = (df['tomorrow_min_temp_MAF'] if self.weather_mode == 'tomorrow'
+                                    else df['today_min_temp_MAF'])
         self.full_df = df.drop(columns=['Agua_Dulce', 'min_temp_f_PEQ'], errors='ignore').dropna().sort_index()
         return self
 
     def run_backtest(self):
         final_results = []
-        feature_cols = [c for c in self.full_df.columns if 'target' not in c and '_M1' not in c]
+        helper_cols = ('today_min_temp_MAF', 'tomorrow_min_temp_MAF')
+        feature_cols = [c for c in self.full_df.columns
+                        if 'target' not in c and '_M1' not in c and c not in helper_cols]
         for trade_year in [2022, 2023, 2024]:
             train = self.full_df.loc[:f"{trade_year - 1}-12-31"]
             test = self.full_df.loc[f"{trade_year}-01-01":f"{trade_year}-12-31"]
@@ -75,12 +89,13 @@ class WhitewaterForwardStrategy:
 
     def simulate_forward_logic(self):
         df = self.results_df
-        df['current_lots'] = np.where(df['tomorrow_min_temp_MAF'] < 35, self.high_vol_lots, self.base_lots)
+        df['current_lots'] = np.where(df['weather_signal_MAF'] < 35, self.high_vol_lots, self.base_lots)
         for s in self.spreads:
             df[f'sig_{s}'] = np.where(df[f'pred_{s}'] > df[s], 1, -1)
-            df[f'daily_pl_{s}'] = df[s].diff().shift(-1) * df[f'sig_{s}'] * df['current_lots'] * self.contract_size
-            df[f'tc_daily_{s}'] = df['current_lots'] * self.contract_size * self.tc_per_mmbtu
-            df[f'daily_pl_{s}'] -= df[f'tc_daily_{s}']
+            df[f'pos_{s}'] = df[f'sig_{s}'] * df['current_lots'] * self.contract_size
+            # Round-trip tc, half on entry/half on exit; same-direction continuation is free.
+            df[f'tc_daily_{s}'] = transaction_cost(df[f'pos_{s}'], self.tc_per_mmbtu)
+            df[f'daily_pl_{s}'] = df[s].diff().shift(-1) * df[f'pos_{s}'] - df[f'tc_daily_{s}']
         df['total_daily_pl'] = df[[f'daily_pl_{s}' for s in self.spreads]].sum(axis=1)
         df['nav'] = df['total_daily_pl'].fillna(0).cumsum()
         return self
@@ -186,10 +201,11 @@ class StrategyAnalyzer:
 
 
 if __name__ == "__main__":
-    DB_PATH = '~/PyCharmProjects/QuantCode26/whitewater/whitewater.db'
+    DB_PATH = str(Path(__file__).resolve().parent / "whitewater.db")
     use_fwd = True
+    weather_mode = 'today'  # 'today' = forecast proxy (no look-ahead); 'tomorrow' = perfect-foresight benchmark
 
-    strategy = WhitewaterForwardStrategy(DB_PATH)
+    strategy = WhitewaterForwardStrategy(DB_PATH, weather_mode=weather_mode)
     strategy.load_and_prep().run_backtest().simulate_forward_logic()
 
     analyzer = StrategyAnalyzer(strategy.results_df, use_forward=use_fwd)

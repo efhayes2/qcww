@@ -7,12 +7,14 @@ from datetime import datetime
 
 
 class WhitewaterMasterTearSheet:
-    def __init__(self, directory='~/data/pngs/', capital=10000000, no_HH=False, tc_per_mmbtu=0.05):
+    def __init__(self, directory='~/data/pngs/', capital=10000000, no_HH=False, tc_per_mmbtu=0.05,
+                 weather_mode='today'):
         self.directory = os.path.expanduser(directory)
         self.source_file = os.path.join(self.directory, 'whitewater_current.csv')
         self.capital = capital
         self.no_HH = no_HH
         self.tc_per_mmbtu = tc_per_mmbtu
+        self.weather_mode = weather_mode
         self.df = None
 
     def load_data(self):
@@ -112,7 +114,8 @@ class WhitewaterMasterTearSheet:
         d = self.calculate_metrics()
         tc_suffix = f"_tc{int(self.tc_per_mmbtu * 100)}"
         hh_suffix = "_no_HH" if self.no_HH else ""
-        pdf_name = f'whitewater_tearsheet_current{tc_suffix}{hh_suffix}.pdf'
+        wx_suffix = f"_{self.weather_mode}"
+        pdf_name = f'whitewater_tearsheet_current{tc_suffix}{hh_suffix}{wx_suffix}.pdf'
         pdf_path = os.path.join(self.directory, pdf_name)
 
         with PdfPages(pdf_path) as pdf:

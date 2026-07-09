@@ -7,7 +7,7 @@
 #
 # def main():
 #     # 1. FILE PATH & DATA LOADING
-#     file_path = os.path.expanduser('~/PyCharmProjects/QuantCode26/whitewater/data/trading_data.xlsx')
+#     file_path = os.path.expanduser('~/PyCharmProjects/qcww/whitewater/data/trading_data.xlsx')
 #
 #     if not os.path.exists(file_path):
 #         print(f"Error: File not found at {file_path}")

@@ -3,7 +3,7 @@ import pandas as pd
 from pathlib import Path
 
 # --- 1. PATH CONFIGURATION ---
-base_dir = Path.home() / "PyCharmProjects" / "QuantCode26" / "whitewater"
+base_dir = Path.home() / "PyCharmProjects" / "qcww" / "whitewater"
 xlsx_path = base_dir / "data" / "trading_data.xlsx"
 db_path = base_dir / "whitewater.db"
 
