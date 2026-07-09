@@ -8,8 +8,14 @@ constant (~training mean) and the trading signal `sign(pred - spread)` degenerat
 into a crude revert-to-a-fixed-level rule. A plain z-score band on the spread's own
 history captures the same mean-reversion more cheaply and with far less turnover.
 
-This module is that honest benchmark. It reuses the spot strategy's data prep so the
-spreads, weather-based sizing, and evaluation window match the ML runs exactly.
+Instrument (`source`)
+---------------------
+- 'forward' (default): trade the M1 swap spreads (HH_M1 - WA_M1, etc.). These are
+  financial and settle/mark daily, so `spread.diff().shift(-1)` P&L is real and
+  tradeable. This is the universe we actually care about.
+- 'spot': trade the physical basis (Henry_Hub - Waha, etc.). Physical spot is
+  delivery, not a next-day-settling instrument, so its diff-based P&L is NOT
+  tradeable -- kept only as a relative signal-quality comparison vs the spot XGB.
 
 Transaction costs (as specified by the desk)
 --------------------------------------------
@@ -26,6 +32,7 @@ import pandas as pd
 from datetime import datetime
 
 from whitewater.gbm_trading_strategy_2 import WhitewaterSpotStrategy
+from whitewater.gbm_strategy_on_forwards import WhitewaterForwardStrategy
 from whitewater.costs import transaction_cost
 
 
@@ -33,30 +40,50 @@ class WahaMeanReversionBenchmark:
     """Z-score band mean-reversion on the Waha basis spreads.
 
     Enter short when the spread is rich (z > entry_z), long when cheap (z < -entry_z),
-    and flatten when it reverts back inside +/- exit_z. Position size reuses the spot
-    strategy's cold-snap sizing so the only thing that differs from the ML run is the
-    signal itself.
+    and flatten when it reverts back inside +/- exit_z. Position sizing reuses the
+    underlying strategy's cold-snap sizing so the only thing that differs from the ML
+    run is the signal itself.
     """
 
-    def __init__(self, excel_path, base_lots=3, high_vol_lots=10, tc_per_mmbtu=0.05,
+    def __init__(self, data_path, source='forward',
+                 base_lots=None, high_vol_lots=None, tc_per_mmbtu=0.05,
                  exclude_hh=False, weather_mode='today',
                  window=60, entry_z=1.5, exit_z=0.25,
-                 start='2021-01-01', end='2024-12-31', mask_uri=True):
+                 start=None, end='2024-12-31', mask_uri=None):
+        if source not in ('forward', 'spot'):
+            raise ValueError("source must be 'forward' or 'spot'")
+        self.source = source
         self.window, self.entry_z, self.exit_z = window, entry_z, exit_z
-        self.start, self.end, self.mask_uri = start, end, mask_uri
         self.tc_per_mmbtu = tc_per_mmbtu
-        # Borrow the spot strategy purely for its data prep (spreads + weather sizing column).
-        self._spot = WhitewaterSpotStrategy(excel_path, base_lots, high_vol_lots,
-                                            tc_per_mmbtu, exclude_hh, weather_mode)
-        self.spreads = self._spot.spreads
-        self.contract_size = self._spot.contract_size
+
+        # Sizing defaults mirror each strategy's own scale. Base:high ratio is 1:3.33 in both,
+        # so Sharpe is identical either way; the absolute lots just match the corresponding
+        # XGB run's dollar P&L.
+        if source == 'forward':
+            base_lots = 15 if base_lots is None else base_lots
+            high_vol_lots = 50 if high_vol_lots is None else high_vol_lots
+            self._strat = WhitewaterForwardStrategy(data_path, base_lots, high_vol_lots,
+                                                    tc_per_mmbtu, weather_mode)
+            start = '2022-01-01' if start is None else start   # M1 swap coverage; matches XGB forward
+            mask_uri = False if mask_uri is None else mask_uri  # Uri (Feb-21) precedes this window
+        else:
+            base_lots = 3 if base_lots is None else base_lots
+            high_vol_lots = 10 if high_vol_lots is None else high_vol_lots
+            self._strat = WhitewaterSpotStrategy(data_path, base_lots, high_vol_lots,
+                                                 tc_per_mmbtu, exclude_hh, weather_mode)
+            start = '2021-01-01' if start is None else start
+            mask_uri = True if mask_uri is None else mask_uri
+
+        self.start, self.end, self.mask_uri = start, end, mask_uri
         self.base_lots, self.high_vol_lots = base_lots, high_vol_lots
+        self.spreads = self._strat.spreads
+        self.contract_size = self._strat.contract_size
         self.df = None
         self.results_df = None
 
     def load_and_prep(self):
-        self._spot.load_and_prep()
-        self.df = self._spot.full_df.loc[self.start:self.end].copy()
+        self._strat.load_and_prep()
+        self.df = self._strat.full_df.loc[self.start:self.end].copy()
         return self
 
     def _band_state(self, spread):
@@ -116,20 +143,22 @@ class WahaMeanReversionBenchmark:
         save_dir = os.path.expanduser(save_dir)
         os.makedirs(save_dir, exist_ok=True)
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.results_df.to_csv(os.path.join(save_dir, f"waha_mr_benchmark_{ts}.csv"))
-        self.results_df.to_csv(os.path.join(save_dir, "waha_mr_benchmark_current.csv"))
+        self.results_df.to_csv(os.path.join(save_dir, f"waha_mr_{self.source}_{ts}.csv"))
+        self.results_df.to_csv(os.path.join(save_dir, f"waha_mr_{self.source}_current.csv"))
         return self
 
 
 if __name__ == "__main__":
     from pathlib import Path
-    XLSX = str(Path(__file__).resolve().parent / "data" / "trading_data.xlsx")
+    DB = str(Path(__file__).resolve().parent / "whitewater.db")
 
-    bench = WahaMeanReversionBenchmark(XLSX, window=60, entry_z=1.5, exit_z=0.25,
-                                       tc_per_mmbtu=0.05, exclude_hh=False)
+    # Tradeable benchmark: mean-reversion on the M1 swap spreads.
+    bench = WahaMeanReversionBenchmark(DB, source='forward', window=60, entry_z=1.5, exit_z=0.25,
+                                       tc_per_mmbtu=0.05)
     bench.load_and_prep().run().export()
 
-    print("Waha mean-reversion benchmark  (z-band k=60, entry=1.5, exit=0.25, tc=$0.05 round-trip)")
+    print(f"Waha MR benchmark [{bench.source} / M1 swaps]  "
+          f"(z-band k=60, entry=1.5, exit=0.25, tc=$0.05 round-trip, {bench.start}..{bench.end})")
     print("-" * 60)
     for k, v in bench.metrics().items():
         print(f"  {k:<20} {v:>14,.2f}" if 'Sharpe' in k or 'Flips' in k
