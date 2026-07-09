@@ -10,6 +10,54 @@ from pathlib import Path
 from whitewater.costs import transaction_cost
 
 
+def build_rolled_forward_spreads(db_path, roll_bd=5, handoff_bd=1):
+    """Within-contract Waha basis spreads from the M1/M2 swap curves.
+
+    The raw M1/M2 columns are a rolling term structure whose underlying contract relabels
+    at NG expiry (~`handoff_bd` BD before EOM), *inside* bid week. Trading the continuous M1
+    series therefore books that expiry jump as fake P&L. Instead we hold the front (M1) most
+    of the month, roll the position into the next contract (M2) at EOM-`roll_bd` BD (bid week
+    opens), and follow that same contract through the relabel (M2 -> M1) so every daily return
+    is within a single contract. Same NG-linked roll calendar for all hubs.
+
+    Returns a DataFrame indexed by date with, per spread s in {hh, katy, hsc}:
+      target_waha_s     : held spread level (drives the z-score signal)
+      ret_target_waha_s : within-contract daily spread change (drives P&L)
+    """
+    tbl = {'HH': 'swap_hh', 'WA': 'swap_wa', 'KT': 'swap_kt', 'HS': 'swap_hs'}
+    conn = sqlite3.connect(str(db_path))
+    legs = {k: pd.read_sql(f"SELECT date,M1,M2 FROM {t}", conn, parse_dates=['date'])
+                 .set_index('date').sort_index() for k, t in tbl.items()}
+    conn.close()
+
+    idx = legs['HH'].index
+    legs = {k: v.reindex(idx).ffill() for k, v in legs.items()}
+    bfe = pd.Series(range(len(idx)), index=idx).groupby(idx.to_period('M')).transform(
+        lambda s: s.max() - s)                                  # 0 = last trading day of month
+    col = pd.Series(np.where((bfe > handoff_bd) & (bfe <= roll_bd), 'M2', 'M1'), index=idx)
+
+    def held(leg):
+        return pd.Series(np.where(col == 'M2', leg['M2'], leg['M1']), index=idx)
+
+    def within_ret(leg):
+        # Return over [t-1, t] on the contract held entering the period (col at t-1). At the
+        # relabel (prev M2 -> now M1) it is the same contract, so read M1_t vs M2_{t-1}. On the
+        # position-roll day (prev M1 -> now M2) we still book the OLD front's move; switching to
+        # M2 is a trade, not a marked jump.
+        pc = col.shift(1)
+        prev = np.where(pc == 'M2', leg['M2'].shift(1), leg['M1'].shift(1))
+        now = np.where(pc == 'M2', np.where(col == 'M1', leg['M1'], leg['M2']), leg['M1'])
+        return pd.Series(now - prev, index=idx)
+
+    hp = {k: held(v) for k, v in legs.items()}
+    wr = {k: within_ret(v) for k, v in legs.items()}
+    out = pd.DataFrame(index=idx)
+    for s, h in {'hh': 'HH', 'katy': 'KT', 'hsc': 'HS'}.items():
+        out[f'target_waha_{s}'] = hp[h] - hp['WA']
+        out[f'ret_target_waha_{s}'] = wr[h] - wr['WA']
+    return out
+
+
 class WhitewaterForwardStrategy:
     def __init__(self, db_path, base_lots=15, high_vol_lots=50, tc_per_mmbtu=0.01, weather_mode='today'):
         self.db_path = Path(os.path.expanduser(db_path))
@@ -73,6 +121,11 @@ class WhitewaterForwardStrategy:
         df['weather_signal_MAF'] = (df['tomorrow_min_temp_MAF'] if self.weather_mode == 'tomorrow'
                                     else df['today_min_temp_MAF'])
 
+        # Roll-aware within-contract returns for P&L (avoids booking the M1 expiry jump).
+        rolled = build_rolled_forward_spreads(self.db_path)
+        ret_cols = [c for c in rolled.columns if c.startswith('ret_target_waha_')]
+        df = df.join(rolled[ret_cols], how='left')
+
         self.full_df = df.drop(columns=['Agua_Dulce', 'min_temp_f_PEQ'], errors='ignore').dropna().sort_index()
         print(
             f"DB Load Complete. Rows: {len(self.full_df)} | Range: {self.full_df.index.min().date()} to {self.full_df.index.max().date()}")
@@ -109,9 +162,10 @@ class WhitewaterForwardStrategy:
         for s in self.spreads:
             df[f'sig_{s}'] = np.where(df[f'pred_{s}'] > df[s], 1, -1)
             df[f'pos_{s}'] = df[f'sig_{s}'] * df['current_lots'] * self.contract_size
-            # Daily P&L based on M1 price movement; round-trip tc, half entry/half exit, holds are free.
+            # P&L on the roll-aware within-contract return (not the continuous-M1 diff, which would
+            # book the monthly expiry jump). Round-trip tc, half entry/half exit, holds are free.
             df[f'tc_daily_{s}'] = transaction_cost(df[f'pos_{s}'], self.tc_per_mmbtu)
-            df[f'daily_pl_{s}'] = df[s].diff().shift(-1) * df[f'pos_{s}'] - df[f'tc_daily_{s}']
+            df[f'daily_pl_{s}'] = df[f'ret_{s}'].shift(-1) * df[f'pos_{s}'] - df[f'tc_daily_{s}']
 
         df['total_daily_pl'] = df[[f'daily_pl_{s}' for s in self.spreads]].sum(axis=1)
         df['nav'] = df['total_daily_pl'].fillna(0).cumsum()

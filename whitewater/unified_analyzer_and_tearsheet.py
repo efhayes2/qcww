@@ -9,6 +9,7 @@ from pathlib import Path
 from matplotlib.gridspec import GridSpec
 
 from whitewater.costs import transaction_cost
+from whitewater.gbm_strategy_on_forwards import build_rolled_forward_spreads
 
 
 class WhitewaterForwardStrategy:
@@ -66,6 +67,10 @@ class WhitewaterForwardStrategy:
         # Single weather driver selected by weather_mode; the only temp column fed downstream.
         df['weather_signal_MAF'] = (df['tomorrow_min_temp_MAF'] if self.weather_mode == 'tomorrow'
                                     else df['today_min_temp_MAF'])
+        # Roll-aware within-contract returns for P&L (avoids booking the M1 expiry jump).
+        rolled = build_rolled_forward_spreads(self.db_path)
+        ret_cols = [c for c in rolled.columns if c.startswith('ret_target_waha_')]
+        df = df.join(rolled[ret_cols], how='left')
         self.full_df = df.drop(columns=['Agua_Dulce', 'min_temp_f_PEQ'], errors='ignore').dropna().sort_index()
         return self
 
@@ -93,9 +98,10 @@ class WhitewaterForwardStrategy:
         for s in self.spreads:
             df[f'sig_{s}'] = np.where(df[f'pred_{s}'] > df[s], 1, -1)
             df[f'pos_{s}'] = df[f'sig_{s}'] * df['current_lots'] * self.contract_size
+            # P&L on the roll-aware within-contract return (not the continuous-M1 diff).
             # Round-trip tc, half on entry/half on exit; same-direction continuation is free.
             df[f'tc_daily_{s}'] = transaction_cost(df[f'pos_{s}'], self.tc_per_mmbtu)
-            df[f'daily_pl_{s}'] = df[s].diff().shift(-1) * df[f'pos_{s}'] - df[f'tc_daily_{s}']
+            df[f'daily_pl_{s}'] = df[f'ret_{s}'].shift(-1) * df[f'pos_{s}'] - df[f'tc_daily_{s}']
         df['total_daily_pl'] = df[[f'daily_pl_{s}' for s in self.spreads]].sum(axis=1)
         df['nav'] = df['total_daily_pl'].fillna(0).cumsum()
         return self
