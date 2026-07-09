@@ -27,6 +27,7 @@ spread). So cost is incurred only on a sign flip or a move to/from flat:
     first entry      : tc/2*|pos|;   final exit: tc/2*|pos|
 """
 import os
+import sqlite3
 import numpy as np
 import pandas as pd
 from datetime import datetime
@@ -34,6 +35,54 @@ from datetime import datetime
 from whitewater.gbm_trading_strategy_2 import WhitewaterSpotStrategy
 from whitewater.gbm_strategy_on_forwards import WhitewaterForwardStrategy
 from whitewater.costs import transaction_cost
+
+
+def build_rolled_forward_spreads(db_path, roll_bd=5, handoff_bd=1):
+    """Within-contract Waha basis spreads from the M1/M2 swap curves.
+
+    The raw M1/M2 columns are a rolling term structure whose underlying contract relabels
+    at NG expiry (~`handoff_bd` BD before EOM), *inside* bid week. Trading the continuous M1
+    series therefore books that expiry jump as fake P&L. Instead we hold the front (M1) most
+    of the month, roll the position into the next contract (M2) at EOM-`roll_bd` BD (bid week
+    opens), and follow that same contract through the relabel (M2 -> M1) so every daily return
+    is within a single contract. Same NG-linked roll calendar for all hubs.
+
+    Returns a DataFrame indexed by date with, per spread s in {hh, katy, hsc}:
+      target_waha_s     : held spread level (drives the z-score signal)
+      ret_target_waha_s : within-contract daily spread change (drives P&L)
+    """
+    tbl = {'HH': 'swap_hh', 'WA': 'swap_wa', 'KT': 'swap_kt', 'HS': 'swap_hs'}
+    conn = sqlite3.connect(str(db_path))
+    legs = {k: pd.read_sql(f"SELECT date,M1,M2 FROM {t}", conn, parse_dates=['date'])
+                 .set_index('date').sort_index() for k, t in tbl.items()}
+    conn.close()
+
+    idx = legs['HH'].index
+    legs = {k: v.reindex(idx).ffill() for k, v in legs.items()}
+    bfe = pd.Series(range(len(idx)), index=idx).groupby(idx.to_period('M')).transform(
+        lambda s: s.max() - s)                                  # 0 = last trading day of month
+    col = pd.Series(np.where((bfe > handoff_bd) & (bfe <= roll_bd), 'M2', 'M1'), index=idx)
+
+    def held(leg):
+        return pd.Series(np.where(col == 'M2', leg['M2'], leg['M1']), index=idx)
+
+    def within_ret(leg):
+        # Return over [t-1, t] on the contract held entering the period (col at t-1). At the
+        # relabel (prev M2 -> now M1) it is the same contract, so read M1_t vs M2_{t-1}. On the
+        # position-roll day (prev M1 -> now M2) we still book the OLD front's move (M1_t vs M1_{t-1});
+        # switching to M2 is a trade, not a marked jump.
+        pc = col.shift(1)
+        prev = np.where(pc == 'M2', leg['M2'].shift(1), leg['M1'].shift(1))
+        now = np.where(pc == 'M2', np.where(col == 'M1', leg['M1'], leg['M2']), leg['M1'])
+        return pd.Series(now - prev, index=idx)
+
+    hp = {k: held(v) for k, v in legs.items()}
+    wr = {k: within_ret(v) for k, v in legs.items()}
+    out = pd.DataFrame(index=idx)
+    for s, h in {'hh': 'HH', 'katy': 'KT', 'hsc': 'HS'}.items():
+        out[f'target_waha_{s}'] = hp[h] - hp['WA']
+        out[f'ret_target_waha_{s}'] = wr[h] - wr['WA']
+    return out
 
 
 class WahaMeanReversionBenchmark:
@@ -49,12 +98,16 @@ class WahaMeanReversionBenchmark:
                  base_lots=None, high_vol_lots=None, tc_per_mmbtu=0.05,
                  exclude_hh=False, weather_mode='today',
                  window=60, entry_z=1.5, exit_z=0.25,
-                 start=None, end='2024-12-31', mask_uri=None):
+                 start=None, end='2024-12-31', mask_uri=None,
+                 roll_aware=None, roll_bd=5, handoff_bd=1):
         if source not in ('forward', 'spot'):
             raise ValueError("source must be 'forward' or 'spot'")
         self.source = source
         self.window, self.entry_z, self.exit_z = window, entry_z, exit_z
         self.tc_per_mmbtu = tc_per_mmbtu
+        # Roll-aware within-contract P&L only applies to the forward (swap) source.
+        self.roll_aware = (source == 'forward') if roll_aware is None else roll_aware
+        self.roll_bd, self.handoff_bd = roll_bd, handoff_bd
 
         # Sizing defaults mirror each strategy's own scale. Base:high ratio is 1:3.33 in both,
         # so Sharpe is identical either way; the absolute lots just match the corresponding
@@ -83,7 +136,14 @@ class WahaMeanReversionBenchmark:
 
     def load_and_prep(self):
         self._strat.load_and_prep()
-        self.df = self._strat.full_df.loc[self.start:self.end].copy()
+        if self.roll_aware:
+            # Roll-aware forward: within-contract spreads from the M1/M2 curves, plus the
+            # weather sizing column carried over from the strategy's prep.
+            rolled = build_rolled_forward_spreads(self._strat.db_path, self.roll_bd, self.handoff_bd)
+            wx = self._strat.full_df[['weather_signal_MAF']]
+            self.df = rolled.join(wx, how='inner').loc[self.start:self.end].copy()
+        else:
+            self.df = self._strat.full_df.loc[self.start:self.end].copy()
         return self
 
     def _band_state(self, spread):
@@ -112,7 +172,9 @@ class WahaMeanReversionBenchmark:
         for s in self.spreads:
             state = self._band_state(s)
             pos = state * lots * self.contract_size
-            gross = df[s].diff().shift(-1) * pos
+            # Roll-aware P&L uses the within-contract return; otherwise the level diff.
+            spread_ret = df[f'ret_{s}'] if f'ret_{s}' in df.columns else df[s].diff()
+            gross = spread_ret.shift(-1) * pos
             cost = transaction_cost(pos, self.tc_per_mmbtu)
             pl = (gross - cost).fillna(0.0)
             if self.mask_uri:
@@ -157,7 +219,7 @@ if __name__ == "__main__":
                                        tc_per_mmbtu=0.05)
     bench.load_and_prep().run().export()
 
-    print(f"Waha MR benchmark [{bench.source} / M1 swaps]  "
+    print(f"Waha MR benchmark [{bench.source} / M1->M2 swaps, roll_aware={bench.roll_aware}]  "
           f"(z-band k=60, entry=1.5, exit=0.25, tc=$0.05 round-trip, {bench.start}..{bench.end})")
     print("-" * 60)
     for k, v in bench.metrics().items():
